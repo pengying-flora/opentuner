@@ -67,7 +67,13 @@ Notes:
   opentuner.db);
 * each configuration's dependencies go into its own venv, but pip hits the
   local cache (no repeated network download); the venv is removed after each
-  run by default, use ``--keep-venv`` to keep it.
+  run by default, use ``--keep-venv`` to keep it;
+* the out-of-tree build artifacts (object files, generated sources) are removed
+  right after each run, keeping only the installed interpreter and run logs so
+  a re-measurement can reuse the cached build; once tuning completes the
+  remaining ``build-<id>/`` directories are removed but the best
+  configuration's installed interpreter is kept for the final comparison -- use
+  ``--keep-builds`` to keep them all.
 """
 
 from __future__ import print_function
@@ -76,6 +82,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 
@@ -338,6 +345,14 @@ class CpythonTuner(MeasurementInterface):
         if not self.args.keep_venv and os.path.isdir(venv_dir):
             shutil.rmtree(venv_dir, ignore_errors=True)
 
+        # Delete the out-of-tree build tree right after this run instead of
+        # waiting for the whole tuning session to end: the object files and
+        # generated sources are large and would otherwise exhaust disk space
+        # across many iterations. install/ and the logs are kept so a
+        # re-measurement of the same configuration can reuse the cached build.
+        if not self.args.keep_builds:
+            self._cleanup_build_intermediates(build_dir)
+
         if status != "OK":
             return Result(state=status, time=float("inf"))
 
@@ -380,9 +395,55 @@ class CpythonTuner(MeasurementInterface):
         print("  CFLAGS =", cflags)
         print("  LDFLAGS =", ldflags)
 
+        # Preserve the best configuration's installed interpreter so it can be
+        # used directly for the final comparison without a rebuild. The build
+        # cache maps (cflags, ldflags) to the build dir that produced it.
+        cached = self._build_cache.get((cflags, ldflags))
+        keep = ()
+        if cached is not None:
+            keep = (os.path.basename(cached[0]),)
+            print("  tuned python:", cached[1])
+
+        # Delete the intermediate build directories now that tuning is done,
+        # keeping the best one.
+        if not self.args.keep_builds:
+            self._cleanup_build_dirs(keep=keep)
+
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+    def _cleanup_build_intermediates(self, build_dir):
+        """Delete the out-of-tree build tree, keeping install/ and the logs.
+
+        After ``make install`` the interpreter under install/ is self-contained,
+        so the object files and generated sources in build_dir are no longer
+        needed; keeping install/ lets a re-measurement reuse the cached build.
+        """
+        keep = ("install", "build.log", "pyperformance.log", "pyperformance.json")
+        if not os.path.isdir(build_dir):
+            return
+        for name in os.listdir(build_dir):
+            if name in keep:
+                continue
+            path = os.path.join(build_dir, name)
+            if os.path.islink(path) or os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _cleanup_build_dirs(self, keep=()):
+        """Remove all build-<id> directories under --build-root, except `keep`."""
+        build_root = os.path.abspath(self.args.build_root)
+        if not os.path.isdir(build_root):
+            return
+        for name in os.listdir(build_root):
+            if re.fullmatch(r"build-\d+", name) and name not in keep:
+                shutil.rmtree(os.path.join(build_root, name), ignore_errors=True)
+                log.info("removed intermediate build directory %s", name)
+
     @staticmethod
     def _tail(path, n=40):
         try:
@@ -428,6 +489,10 @@ def _add_args(argparser):
     argparser.add_argument(
         "--output-dir", default=".",
         help="directory for the best-configuration output")
+    argparser.add_argument(
+        "--keep-builds", action="store_true",
+        help="keep intermediate build directories after tuning completes "
+             "(removed by default)")
     return argparser
 
 
