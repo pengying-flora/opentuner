@@ -32,8 +32,13 @@ appended to NODIST by ``--with-lto`` / ``--enable-optimizations`` and come
 after the user CFLAGS, so they cannot be overridden via ``CFLAGS`` and are
 intentionally left out of the search space.
 
+``--enable-bolt`` (BOLT post-link optimization, new in CPython 3.12) is a
+configure-level flag rather than a CFLAGS, so it is exposed as its own
+``bolt`` parameter (on/off) and appended to the configure command. It requires
+``llvm-bolt`` and ``merge-fdata`` on PATH.
+
 For each configuration the tuner:
-  1. builds a python3.10 out-of-tree via configure + make + make install;
+  1. builds a python3 out-of-tree via configure + make + make install;
   2. runs pyperformance on that interpreter using the host python;
   3. parses the pyperformance JSON output and scores the run as the geometric
      mean of all benchmark medians (lower is faster), which is returned to
@@ -150,6 +155,9 @@ class CpythonTuner(MeasurementInterface):
         # Whether to target the local CPU microarchitecture
         # (-march=native / -mtune=native).
         manipulator.add_parameter(EnumParameter("march", ["default", "native"]))
+        # BOLT post-link optimization (new in CPython 3.12). A configure-level
+        # flag, so it is handled by _cfg_to_configure_flags, not CFLAGS.
+        manipulator.add_parameter(EnumParameter("bolt", ["on", "off"]))
 
         for flag in COMPILE_FLAGS:
             manipulator.add_parameter(
@@ -185,14 +193,34 @@ class CpythonTuner(MeasurementInterface):
         # (e.g. -Wl,-O1).
         return ""
 
+    def _cfg_to_configure_flags(self, cfg):
+        """Return extra configure-level flags driven by the configuration.
+
+        BOLT (--enable-bolt) is a post-link optimizer introduced in CPython
+        3.12 and cannot be expressed as a CFLAGS, so it is appended to the
+        configure command instead. It requires llvm-bolt and merge-fdata on
+        PATH (configure errors out otherwise, which the tuner sees as a build
+        failure).
+        """
+        flags = []
+        if cfg["bolt"] == "on":
+            flags.append("--enable-bolt")
+        return " ".join(flags)
+
     # ------------------------------------------------------------------
     # Build CPython
     # ------------------------------------------------------------------
-    def _build(self, build_dir, cflags, ldflags):
+    def _build(self, build_dir, cflags, ldflags, extra_configure_flags=""):
         build_dir = os.path.abspath(build_dir)
         prefix = os.path.join(build_dir, "install")
         configure = os.path.join(self.args.source_dir, "configure")
         logfile = os.path.join(build_dir, "build.log")
+
+        # Fixed configure flags (PGO/LTO, etc.) plus any tunable
+        # configure-level flags such as --enable-bolt.
+        configure_flags = self.args.configure_flags
+        if extra_configure_flags:
+            configure_flags = (configure_flags + " " + extra_configure_flags).strip()
 
         os.makedirs(build_dir, exist_ok=True)
 
@@ -213,12 +241,13 @@ class CpythonTuner(MeasurementInterface):
             ldflags=shlex.quote(ldflags),
             configure=shlex.quote(configure),
             prefix=shlex.quote(prefix),
-            configure_flags=self.args.configure_flags,
+            configure_flags=configure_flags,
             jobs=self.args.jobs,
             log=shlex.quote(logfile),
         )
 
-        log.info("building: CFLAGS=%s LDFLAGS=%s", cflags, ldflags)
+        log.info("building: CFLAGS=%s LDFLAGS=%s CONFIGURE=%s",
+                 cflags, ldflags, configure_flags)
         result = self.call_program(cmd, limit=self.args.build_timeout)
 
         if result["timeout"]:
@@ -317,8 +346,9 @@ class CpythonTuner(MeasurementInterface):
         cfg = desired_result.configuration.data
         cflags = self._cfg_to_cflags(cfg)
         ldflags = self._cfg_to_ldflags(cfg)
+        configure_flags = self._cfg_to_configure_flags(cfg)
 
-        cache_key = (cflags, ldflags)
+        cache_key = (cflags, ldflags, configure_flags)
         cached = self._build_cache.get(cache_key)
         if cached is not None:
             build_dir, python_bin = cached
@@ -326,7 +356,7 @@ class CpythonTuner(MeasurementInterface):
             build_dir = os.path.join(
                 os.path.abspath(self.args.build_root),
                 "build-%d" % desired_result.id)
-            prefix = self._build(build_dir, cflags, ldflags)
+            prefix = self._build(build_dir, cflags, ldflags, configure_flags)
             if prefix is None:
                 return Result(state="ERROR", time=float("inf"))
 
@@ -370,6 +400,13 @@ class CpythonTuner(MeasurementInterface):
         cfg = configuration.data
         cflags = self._cfg_to_cflags(cfg)
         ldflags = self._cfg_to_ldflags(cfg)
+        configure_flags = self._cfg_to_configure_flags(cfg)
+
+        # Fixed configure flags (PGO/LTO, etc.) plus tunable configure-level
+        # flags (e.g. --enable-bolt).
+        full_configure_flags = self.args.configure_flags
+        if configure_flags:
+            full_configure_flags = (full_configure_flags + " " + configure_flags).strip()
 
         os.makedirs(self.args.output_dir, exist_ok=True)
         out_json = os.path.join(self.args.output_dir, "best_config.json")
@@ -386,19 +423,20 @@ class CpythonTuner(MeasurementInterface):
             fd.write(
                 "cd build/best && %s/configure --prefix=$PWD/install %s && "
                 "make -j && make install\n"
-                % (shlex.quote(self.args.source_dir),
-                   self.args.configure_flags))
+                % (shlex.quote(self.args.source_dir), full_configure_flags))
 
         print("Best configuration written to:")
         print("  ", out_json)
         print("  ", out_sh)
         print("  CFLAGS =", cflags)
         print("  LDFLAGS =", ldflags)
+        print("  CONFIGURE =", full_configure_flags)
 
         # Preserve the best configuration's installed interpreter so it can be
         # used directly for the final comparison without a rebuild. The build
-        # cache maps (cflags, ldflags) to the build dir that produced it.
-        cached = self._build_cache.get((cflags, ldflags))
+        # cache maps (cflags, ldflags, configure flags) to the build dir that
+        # produced it.
+        cached = self._build_cache.get((cflags, ldflags, configure_flags))
         keep = ()
         if cached is not None:
             keep = (os.path.basename(cached[0]),)
