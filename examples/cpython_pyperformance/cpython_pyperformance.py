@@ -65,6 +65,18 @@ Notes:
                         to stop by wall-clock time;
 * ``--parallelism 1``   build one configuration at a time so parallel makes
                         don't thrash the CPU;
+* with ``--fast`` the tuning ends with a final phase: the ``--topn N`` best
+  configurations (default 5) are re-measured WITHOUT ``-f`` (full
+  pyperformance mode), re-ranked by those full-mode scores and written to
+  ``topn_results.json``; the champion reported in ``best_config.json`` /
+  ``best_flags.sh`` comes from this full-mode ranking, so the reported
+  improvement is reproducible in full-mode re-testing;
+* a non-zero pyperformance exit does not discard a configuration when the
+  result file still parses: pyperformance exits non-zero as soon as ONE
+  benchmark dies, so the geomean over the surviving benchmarks is salvaged
+  instead (benchmarks broken on the target interpreter, e.g. sympy 1.8
+  importing distutils on 3.12, then cost a fixed set of missing entries
+  rather than poisoning every configuration);
 * per-configuration build/run timeouts are controlled by ``--build-timeout`` /
   ``--run-timeout`` (this fork's ``--test-limit`` is no longer a per-test
   timeout, see above);
@@ -279,24 +291,42 @@ class CpythonTuner(MeasurementInterface):
     # ------------------------------------------------------------------
     # Run pyperformance and parse the score
     # ------------------------------------------------------------------
-    def _run_pyperformance(self, build_dir, python_bin, result_path):
+    def _run_pyperformance(self, build_dir, python_bin, result_path, fast=None):
         """Run pyperformance; return "OK" / "TIMEOUT" / "ERROR"."""
+        if fast is None:
+            fast = self.args.fast
         logfile = os.path.join(build_dir, "pyperformance.log")
 
         cmd = [
+            # Drop SETUPTOOLS_USE_DISTUTILS from the child environment: with
+            # "stdlib" setuptools' distutils shim stays inactive and 3.12 has
+            # no stdlib distutils, so benchmarks importing distutils
+            # (sympy 1.8, django 3.2.4) would die on every run.
+            "env", "-u", "SETUPTOOLS_USE_DISTUTILS",
             self.args.pyperformance_python, "-m", "pyperformance", "run",
             "--python", python_bin,
             "-o", result_path,
         ]
-        if self.args.fast:
+        if fast:
             cmd.append("-f")
         if self.args.benchmarks:
-            cmd += ["-b", self.args.benchmarks]
+            # "=" form so exclusion lists ("-sympy,...") survive argparse.
+            cmd += ["-b=" + self.args.benchmarks]
 
-        # Run inside build_dir so pyperformance's venv/ lands under build_dir
-        # and can be cleaned up together with it.
+        # pyperformance resolves its venv root relative to the cwd
+        # (_venv.get_venv_root -> abspath("venv/...")), so run from a
+        # dedicated empty subdir of build_dir: the venv still lands under
+        # build_dir for cleanup, but the cwd must NOT be the build root --
+        # it contains pybuilddir.txt, and setuptools' distutils shim
+        # (_distutils_hack.DistutilsMetaFinder.is_cpython) disables itself
+        # when that file exists in the cwd ("am I inside the CPython
+        # repo?").  On 3.12 (PEP 632) there is no stdlib distutils to fall
+        # back to, so sympy 1.8 and django 3.2.4 (both import distutils at
+        # runtime) died on every single run.
+        run_cwd = os.path.join(build_dir, "bench")
+        os.makedirs(run_cwd, exist_ok=True)
         result = self.call_program(
-            cmd, limit=self.args.run_timeout, cwd=build_dir)
+            cmd, limit=self.args.run_timeout, cwd=run_cwd)
 
         # Persist stdout/stderr for troubleshooting individual runs.
         with open(logfile, "wb") as fd:
@@ -344,6 +374,38 @@ class CpythonTuner(MeasurementInterface):
     # ------------------------------------------------------------------
     def run(self, desired_result, input, limit):  # noqa: A002
         cfg = desired_result.configuration.data
+
+        got = self._get_build(cfg, "build-%d" % desired_result.id)
+        if got is None:
+            return Result(state="ERROR", time=float("inf"))
+        build_dir, python_bin = got
+
+        result_path = os.path.join(build_dir, "pyperformance.json")
+        status = self._run_pyperformance(build_dir, python_bin, result_path)
+        self._post_run_cleanup(build_dir)
+
+        if status == "TIMEOUT":
+            # A partial result after a timeout only covers the benchmarks
+            # that finished (roughly the fast ones first), which would bias
+            # the geomean, so do not salvage it.
+            return Result(state="TIMEOUT", time=float("inf"))
+
+        score = self._parse_score(result_path)
+        if score is None:
+            return Result(state="ERROR", time=float("inf"))
+
+        if status == "ERROR":
+            log.warning("pyperformance failed; salvaged partial score "
+                        "(broken benchmarks excluded)")
+        else:
+            log.info("score (geomean of medians) = %.4f s", score)
+        return Result(time=score)
+
+    # ------------------------------------------------------------------
+    # Build cache shared by the search phase and the final top-N phase
+    # ------------------------------------------------------------------
+    def _get_build(self, cfg, dirname):
+        """Return (build_dir, python_bin) for cfg, building it if needed."""
         cflags = self._cfg_to_cflags(cfg)
         ldflags = self._cfg_to_ldflags(cfg)
         configure_flags = self._cfg_to_configure_flags(cfg)
@@ -351,27 +413,27 @@ class CpythonTuner(MeasurementInterface):
         cache_key = (cflags, ldflags, configure_flags)
         cached = self._build_cache.get(cache_key)
         if cached is not None:
-            build_dir, python_bin = cached
-        else:
-            build_dir = os.path.join(
-                os.path.abspath(self.args.build_root),
-                "build-%d" % desired_result.id)
-            prefix = self._build(build_dir, cflags, ldflags, configure_flags)
-            if prefix is None:
-                return Result(state="ERROR", time=float("inf"))
+            return cached
 
-            python_bin = self._find_python(prefix)
-            if python_bin is None:
-                log.error("could not find a python3 executable under install")
-                return Result(state="ERROR", time=float("inf"))
-            self._build_cache[cache_key] = (build_dir, python_bin)
+        build_dir = os.path.join(
+            os.path.abspath(self.args.build_root), dirname)
+        prefix = self._build(build_dir, cflags, ldflags, configure_flags)
+        if prefix is None:
+            return None
 
-        result_path = os.path.join(build_dir, "pyperformance.json")
-        status = self._run_pyperformance(build_dir, python_bin, result_path)
+        python_bin = self._find_python(prefix)
+        if python_bin is None:
+            log.error("could not find a python3 executable under install")
+            return None
 
+        self._build_cache[cache_key] = (build_dir, python_bin)
+        return (build_dir, python_bin)
+
+    def _post_run_cleanup(self, build_dir):
+        """Remove the venv and build intermediates after one measurement."""
         # Remove the venv after the run to save disk (deps are already in the
         # pip cache and would just be reinstalled if the config is re-measured).
-        venv_dir = os.path.join(build_dir, "venv")
+        venv_dir = os.path.join(build_dir, "bench", "venv")
         if not self.args.keep_venv and os.path.isdir(venv_dir):
             shutil.rmtree(venv_dir, ignore_errors=True)
 
@@ -383,21 +445,120 @@ class CpythonTuner(MeasurementInterface):
         if not self.args.keep_builds:
             self._cleanup_build_intermediates(build_dir)
 
-        if status != "OK":
-            return Result(state=status, time=float("inf"))
+    # ------------------------------------------------------------------
+    # Final phase: re-measure the top-N configurations in full mode
+    # ------------------------------------------------------------------
+    def _top_config_results(self, n):
+        """Best n distinct successful configurations, best-first."""
+        ranked = []
+        seen = set()
+        for result in self.driver.results_query(objective_ordered=True):
+            if result.state != "OK" or result.time is None:
+                continue
+            if not math.isfinite(result.time):
+                continue
+            cfg = result.configuration.data
+            key = json.dumps(cfg, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            ranked.append((result.time, cfg))
+            if len(ranked) >= n:
+                break
+        return ranked
 
-        score = self._parse_score(result_path)
-        if score is None:
-            return Result(state="ERROR", time=float("inf"))
+    def _remeasure_topn(self, n):
+        """Re-measure the top-n configurations in full pyperformance mode.
 
-        log.info("score (geomean of medians) = %.4f s", score)
-        return Result(time=score)
+        Search runs use --fast (one value per benchmark); its noise can
+        reorder closely-spaced configurations, so the final ranking is
+        redone without -f and the champion is picked from these full-mode
+        scores.  Builds are reused from the cache when possible.
+        """
+        ranked = self._top_config_results(n)
+        entries = []
+        for rank, (fast_time, cfg) in enumerate(ranked, 1):
+            log.info("top-%d/%d full-mode re-measure: CFLAGS=%s",
+                     rank, len(ranked), self._cfg_to_cflags(cfg))
+            full_time = None
+            build_dir = None
+            got = self._get_build(cfg, "build-top%d" % rank)
+            if got is not None:
+                build_dir, python_bin = got
+                result_path = os.path.join(
+                    build_dir, "pyperformance_full.json")
+                status = self._run_pyperformance(
+                    build_dir, python_bin, result_path, fast=False)
+                self._post_run_cleanup(build_dir)
+                if status == "OK":
+                    full_time = self._parse_score(result_path)
+            if full_time is None:
+                log.error("top-%d full-mode re-measure failed", rank)
+            else:
+                log.info("top-%d full-mode score = %.4f s (fast: %.4f s)",
+                         rank, full_time, fast_time)
+            entries.append({
+                "rank_by_fast": rank,
+                "time_fast": fast_time,
+                "time_full": full_time,
+                "config": cfg,
+                "build_dir": build_dir,
+            })
+        # Full-mode score decides the final order; failed re-measures sink.
+        entries.sort(key=lambda e: (e["time_full"] is None,
+                                    e["time_full"] or 0.0))
+        return entries
+
+    def _write_topn_results(self, entries):
+        """Print and save the full-mode ranking of the top configurations."""
+        out = os.path.join(self.args.output_dir, "topn_results.json")
+        records = []
+        print("Top-%d configurations (ranked by FULL-mode score):"
+              % len(entries))
+        for rank, entry in enumerate(entries, 1):
+            cfg = entry["config"]
+            configure_flags = (self.args.configure_flags + " " +
+                               self._cfg_to_configure_flags(cfg)).strip()
+            print("  #%d  full=%s  fast=%.4f s" % (
+                rank,
+                ("%.4f s" % entry["time_full"]
+                 if entry["time_full"] is not None else "FAILED"),
+                entry["time_fast"]))
+            print("      CFLAGS=%s" % self._cfg_to_cflags(cfg))
+            print("      CONFIGURE=%s" % configure_flags)
+            records.append({
+                "rank": rank,
+                "time_fast": entry["time_fast"],
+                "time_full": entry["time_full"],
+                "cflags": self._cfg_to_cflags(cfg),
+                "ldflags": self._cfg_to_ldflags(cfg),
+                "configure_flags": configure_flags,
+                "config": cfg,
+                "build_dir": entry["build_dir"],
+                "pyperformance_full_json": (
+                    os.path.join(entry["build_dir"],
+                                 "pyperformance_full.json")
+                    if entry["build_dir"] else None),
+            })
+        with open(out, "w") as fd:
+            json.dump(records, fd, indent=2, sort_keys=True)
+        print("  written to:", out)
 
     # ------------------------------------------------------------------
     # Emit the best configuration at the end of tuning
     # ------------------------------------------------------------------
     def save_final_config(self, configuration):
         cfg = configuration.data
+
+        # Optional final phase: re-rank the best configurations with full
+        # (non-fast) pyperformance runs; the champion then comes from the
+        # full-mode ranking, not from the noisy --fast search.
+        entries = []
+        if self.args.fast and self.args.topn > 0:
+            entries = self._remeasure_topn(self.args.topn)
+            if entries and entries[0]["time_full"] is not None:
+                cfg = entries[0]["config"]
+
         cflags = self._cfg_to_cflags(cfg)
         ldflags = self._cfg_to_ldflags(cfg)
         configure_flags = self._cfg_to_configure_flags(cfg)
@@ -432,6 +593,9 @@ class CpythonTuner(MeasurementInterface):
         print("  LDFLAGS =", ldflags)
         print("  CONFIGURE =", full_configure_flags)
 
+        if entries:
+            self._write_topn_results(entries)
+
         # Preserve the best configuration's installed interpreter so it can be
         # used directly for the final comparison without a rebuild. The build
         # cache maps (cflags, ldflags, configure flags) to the build dir that
@@ -457,7 +621,8 @@ class CpythonTuner(MeasurementInterface):
         so the object files and generated sources in build_dir are no longer
         needed; keeping install/ lets a re-measurement reuse the cached build.
         """
-        keep = ("install", "build.log", "pyperformance.log", "pyperformance.json")
+        keep = ("install", "bench", "build.log", "pyperformance.log",
+                "pyperformance.json", "pyperformance_full.json")
         if not os.path.isdir(build_dir):
             return
         for name in os.listdir(build_dir):
@@ -473,12 +638,12 @@ class CpythonTuner(MeasurementInterface):
                 shutil.rmtree(path, ignore_errors=True)
 
     def _cleanup_build_dirs(self, keep=()):
-        """Remove all build-<id> directories under --build-root, except `keep`."""
+        """Remove all build-<id>/build-top<N> dirs under --build-root, except `keep`."""
         build_root = os.path.abspath(self.args.build_root)
         if not os.path.isdir(build_root):
             return
         for name in os.listdir(build_root):
-            if re.fullmatch(r"build-\d+", name) and name not in keep:
+            if re.fullmatch(r"build-(\d+|top\d+)", name) and name not in keep:
                 shutil.rmtree(os.path.join(build_root, name), ignore_errors=True)
                 log.info("removed intermediate build directory %s", name)
 
@@ -531,6 +696,11 @@ def _add_args(argparser):
         "--keep-builds", action="store_true",
         help="keep intermediate build directories after tuning completes "
              "(removed by default)")
+    argparser.add_argument(
+        "--topn", type=int, default=5,
+        help="with --fast: re-measure the N best configurations in full "
+             "pyperformance mode at the end, rank by those scores and write "
+             "topn_results.json (0 disables)")
     return argparser
 
 
